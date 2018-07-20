@@ -153,10 +153,17 @@ macro_rules! print {
 /// ```
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow_internal_unstable]
 macro_rules! println {
     () => (print!("\n"));
-    ($fmt:expr) => (print!(concat!($fmt, "\n")));
-    ($fmt:expr, $($arg:tt)*) => (print!(concat!($fmt, "\n"), $($arg)*));
+    ($($arg:tt)*) => ({
+        #[cfg(not(stage0))] {
+            ($crate::io::_print(format_args_nl!($($arg)*)));
+        }
+        #[cfg(stage0)] {
+            print!("{}\n", format_args!($($arg)*))
+        }
+    })
 }
 
 /// Macro for printing to the standard error.
@@ -399,6 +406,19 @@ pub mod builtin {
         ($fmt:expr, $($args:tt)*) => ({ /* compiler built-in */ });
     }
 
+    /// Internal version of [`format_args`].
+    ///
+    /// This macro differs from [`format_args`] in that it appends a newline to the format string
+    /// and nothing more. It is perma-unstable.
+    ///
+    /// [`format_args`]: ../std/macro.format_args.html
+    #[doc(hidden)]
+    #[unstable(feature = "println_format_args", issue="0")]
+    #[macro_export]
+    macro_rules! format_args_nl {
+        ($fmt:expr) => ({ /* compiler built-in */ });
+        ($fmt:expr, $($args:tt)*) => ({ /* compiler built-in */ });
+    }
     /// Inspect an environment variable at compile time.
     ///
     /// This macro will expand to the value of the named environment variable at
