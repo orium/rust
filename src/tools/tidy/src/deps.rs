@@ -101,6 +101,7 @@ const WHITELIST: &[Crate<'_>] = &[
     Crate("fortanix-sgx-abi"),
     Crate("fuchsia-zircon"),
     Crate("fuchsia-zircon-sys"),
+    Crate("generational-arena"),
     Crate("getopts"),
     Crate("getrandom"),
     Crate("hashbrown"),

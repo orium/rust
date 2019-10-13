@@ -5,6 +5,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use generational_arena::{Index as ArenaIndex};
 
 impl<O: ForestObligation> ObligationForest<O> {
     /// Creates a graphviz representation of the obligation forest. Given a directory this will
@@ -38,15 +39,16 @@ impl<O: ForestObligation> ObligationForest<O> {
 }
 
 impl<'a, O: ForestObligation + 'a> dot::Labeller<'a> for &'a ObligationForest<O> {
-    type Node = usize;
-    type Edge = (usize, usize);
+    type Node = ArenaIndex;
+    type Edge = (ArenaIndex, ArenaIndex);
 
     fn graph_id(&self) -> dot::Id<'_> {
         dot::Id::new("trait_obligation_forest").unwrap()
     }
 
     fn node_id(&self, index: &Self::Node) -> dot::Id<'_> {
-        dot::Id::new(format!("obligation_{}", index)).unwrap()
+        let (index, generation) = index.into_raw_parts();
+        dot::Id::new(format!("obligation_{}_{}", index, generation)).unwrap()
     }
 
     fn node_label(&self, index: &Self::Node) -> dot::LabelText<'_> {
@@ -62,18 +64,16 @@ impl<'a, O: ForestObligation + 'a> dot::Labeller<'a> for &'a ObligationForest<O>
 }
 
 impl<'a, O: ForestObligation + 'a> dot::GraphWalk<'a> for &'a ObligationForest<O> {
-    type Node = usize;
-    type Edge = (usize, usize);
+    type Node = ArenaIndex;
+    type Edge = (ArenaIndex, ArenaIndex);
 
     fn nodes(&self) -> dot::Nodes<'_, Self::Node> {
-        (0..self.nodes.len()).collect()
+        self.nodes.iter().map(|(index, _)| index).collect()
     }
 
     fn edges(&self) -> dot::Edges<'_, Self::Edge> {
-        (0..self.nodes.len())
-            .flat_map(|i| {
-                let node = &self.nodes[i];
-
+        self.nodes.iter()
+            .flat_map(|(i, node)| {
                 node.dependents.iter().map(move |&d| (d, i))
             })
             .collect()

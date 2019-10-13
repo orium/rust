@@ -74,11 +74,12 @@
 
 use crate::fx::{FxHashMap, FxHashSet};
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash;
 use std::marker::PhantomData;
+use generational_arena::{Arena, Index as ArenaIndex};
 
 mod graphviz;
 
@@ -137,11 +138,11 @@ pub struct ObligationForest<O: ForestObligation> {
     /// At the end of processing, those nodes will be removed by a
     /// call to `compress`.
     ///
-    /// `usize` indices are used here and throughout this module, rather than
+    /// `usize` indices are used here and throughout this module, rather than                  WIP!
     /// `rustc_index::newtype_index!` indices, because this code is hot enough that the
     /// `u32`-to-`usize` conversions that would be required are significant,
     /// and space considerations are not important.
-    nodes: Vec<Node<O>>,
+    nodes: Arena<Node<O>>,
 
     /// A cache of predicates that have been successfully completed.
     done_cache: FxHashSet<O::Predicate>,
@@ -149,10 +150,7 @@ pub struct ObligationForest<O: ForestObligation> {
     /// A cache of the nodes in `nodes`, indexed by predicate. Unfortunately,
     /// its contents are not guaranteed to match those of `nodes`. See the
     /// comments in `process_obligation` for details.
-    active_cache: FxHashMap<O::Predicate, usize>,
-
-    /// A vector reused in compress(), to avoid allocating new vectors.
-    node_rewrites: RefCell<Vec<usize>>,
+    active_cache: FxHashMap<O::Predicate, ArenaIndex>,
 
     obligation_tree_id_generator: ObligationTreeIdGenerator,
 
@@ -164,6 +162,8 @@ pub struct ObligationForest<O: ForestObligation> {
     ///
     /// [details]: https://github.com/rust-lang/rust/pull/53255#issuecomment-421184780
     error_cache: FxHashMap<ObligationTreeId, FxHashSet<O::Predicate>>,
+
+    node_order_generator: usize,
 }
 
 #[derive(Debug)]
@@ -173,7 +173,7 @@ struct Node<O> {
 
     /// Obligations that depend on this obligation for their completion. They
     /// must all be in a non-pending state.
-    dependents: Vec<usize>,
+    dependents: Vec<ArenaIndex>,
 
     /// If true, dependents[0] points to a "parent" node, which requires
     /// special treatment upon error but is otherwise treated the same.
@@ -184,13 +184,16 @@ struct Node<O> {
 
     /// Identifier of the obligation tree to which this node belongs.
     obligation_tree_id: ObligationTreeId,
+
+    order: usize
 }
 
 impl<O> Node<O> {
     fn new(
-        parent: Option<usize>,
+        parent: Option<ArenaIndex>,
         obligation: O,
-        obligation_tree_id: ObligationTreeId
+        obligation_tree_id: ObligationTreeId,
+        order: usize
     ) -> Node<O> {
         Node {
             obligation,
@@ -203,6 +206,7 @@ impl<O> Node<O> {
                 },
             has_parent: parent.is_some(),
             obligation_tree_id,
+            order
         }
     }
 }
@@ -271,12 +275,12 @@ pub struct Error<O, E> {
 impl<O: ForestObligation> ObligationForest<O> {
     pub fn new() -> ObligationForest<O> {
         ObligationForest {
-            nodes: vec![],
+            nodes: Arena::new(),
             done_cache: Default::default(),
             active_cache: Default::default(),
-            node_rewrites: RefCell::new(vec![]),
             obligation_tree_id_generator: (0..).map(ObligationTreeId),
             error_cache: Default::default(),
+            node_order_generator: 0,
         }
     }
 
@@ -293,7 +297,11 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     // Returns Err(()) if we already know this obligation failed.
-    fn register_obligation_at(&mut self, obligation: O, parent: Option<usize>) -> Result<(), ()> {
+    fn register_obligation_at(
+        &mut self,
+        obligation: O,
+        parent: Option<ArenaIndex>
+    ) -> Result<(), ()> {
         if self.done_cache.contains(obligation.as_predicate()) {
             return Ok(());
         }
@@ -338,9 +346,17 @@ impl<O: ForestObligation> ObligationForest<O> {
                 if already_failed {
                     Err(())
                 } else {
-                    let new_index = self.nodes.len();
-                    v.insert(new_index);
-                    self.nodes.push(Node::new(parent, obligation, obligation_tree_id));
+                    let new_node =
+                        Node::new(
+                            parent,
+                            obligation,
+                            obligation_tree_id,
+                            self.node_order_generator
+                        );
+                    let index =
+                        self.nodes.insert(new_node);
+                    self.node_order_generator += 1;
+                    v.insert(index);
                     Ok(())
                 }
             }
@@ -348,13 +364,18 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     /// Converts all remaining obligations to the given error.
-    pub fn to_errors<E: Clone>(&mut self, error: E) -> Vec<Error<O, E>> {
-        let errors = self.nodes.iter().enumerate()
-            .filter(|(_index, node)| node.state.get() == NodeState::Pending)
-            .map(|(index, _node)| {
+    pub fn get_errors<E: Clone>(&mut self, error: E) -> Vec<Error<O, E>> {
+        let mut pending_nodes: Vec<_> = self.nodes.iter()
+            .filter(|(_, node)| node.state.get() == NodeState::Pending)
+            .collect();
+
+        pending_nodes.sort_by_key(|(_, node)| node.order);
+
+        let errors: Vec<Error<O, E>> = pending_nodes.iter()
+            .map(|(index, _)| {
                 Error {
                     error: error.clone(),
-                    backtrace: self.error_at(index),
+                    backtrace: self.error_at(*index),
                 }
             })
             .collect();
@@ -369,12 +390,13 @@ impl<O: ForestObligation> ObligationForest<O> {
         where F: Fn(&O) -> P
     {
         self.nodes.iter()
+            .map(|(_, node)| node)
             .filter(|node| node.state.get() == NodeState::Pending)
             .map(|node| f(&node.obligation))
             .collect()
     }
 
-    fn insert_into_error_cache(&mut self, index: usize) {
+    fn insert_into_error_cache(&mut self, index: ArenaIndex) {
         let node = &self.nodes[index];
         self.error_cache
             .entry(node.obligation_tree_id)
@@ -394,11 +416,12 @@ impl<O: ForestObligation> ObligationForest<O> {
 
         let mut errors = vec![];
         let mut stalled = true;
+        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
 
-        for index in 0..self.nodes.len() {
+        for index in indexes {
             let node = &mut self.nodes[index];
 
-            debug!("process_obligations: node {} == {:?}", index, node);
+            debug!("process_obligations: node {:?} == {:?}", index, node);
 
             // `processor.process_obligation` can modify the predicate within
             // `node.obligation`, and that predicate is the key used for
@@ -410,7 +433,7 @@ impl<O: ForestObligation> ObligationForest<O> {
             }
             let result = processor.process_obligation(&mut node.obligation);
 
-            debug!("process_obligations: node {} got result {:?}", index, result);
+            debug!("process_obligations: node {:?} got result {:?}", index, result);
 
             match result {
                 ProcessResult::Unchanged => {
@@ -477,7 +500,7 @@ impl<O: ForestObligation> ObligationForest<O> {
 
         debug!("process_cycles()");
 
-        for (index, node) in self.nodes.iter().enumerate() {
+        for (index, node) in self.nodes.iter() {
             // For some benchmarks this state test is extremely
             // hot. It's a win to handle the no-op cases immediately to avoid
             // the cost of the function call.
@@ -491,7 +514,12 @@ impl<O: ForestObligation> ObligationForest<O> {
         debug_assert!(stack.is_empty());
     }
 
-    fn find_cycles_from_node<P>(&self, stack: &mut Vec<usize>, processor: &mut P, index: usize)
+    fn find_cycles_from_node<P>(
+        &self,
+        stack: &mut Vec<ArenaIndex>,
+        processor: &mut P,
+        index: ArenaIndex
+    )
         where P: ObligationProcessor<Obligation=O>
     {
         let node = &self.nodes[index];
@@ -518,8 +546,8 @@ impl<O: ForestObligation> ObligationForest<O> {
 
     /// Returns a vector of obligations for `p` and all of its
     /// ancestors, putting them into the error state in the process.
-    fn error_at(&self, mut index: usize) -> Vec<O> {
-        let mut error_stack: Vec<usize> = vec![];
+    fn error_at(&self, mut index: ArenaIndex) -> Vec<O> {
+        let mut error_stack: Vec<ArenaIndex> = vec![];
         let mut trace = vec![];
 
         loop {
@@ -577,16 +605,16 @@ impl<O: ForestObligation> ObligationForest<O> {
 
     /// Marks all nodes that depend on a pending node as `NodeState::Waiting`.
     fn mark_as_waiting(&self) {
-        for node in &self.nodes {
+        for (_, node) in self.nodes.iter() {
             if node.state.get() == NodeState::Waiting {
                 node.state.set(NodeState::Success);
             }
         }
 
-        for node in &self.nodes {
+        for (_, node) in self.nodes.iter() {
             if node.state.get() == NodeState::Pending {
                 // This call site is hot.
-                self.inlined_mark_neighbors_as_waiting_from(node);
+                self.inlined_mark_neighbors_as_waiting_from(&node);
             }
         }
     }
@@ -598,47 +626,32 @@ impl<O: ForestObligation> ObligationForest<O> {
     /// on these nodes may be present. This is done by e.g., `process_cycles`.
     #[inline(never)]
     fn compress(&mut self, do_completed: DoCompleted) -> Option<Vec<O>> {
-        let orig_nodes_len = self.nodes.len();
-        let mut node_rewrites: Vec<_> = self.node_rewrites.replace(vec![]);
-        debug_assert!(node_rewrites.is_empty());
-        node_rewrites.extend(0..orig_nodes_len);
-        let mut dead_nodes = 0;
-        let mut removed_done_obligations: Vec<O> = vec![];
+        let mut done_obligations: Vec<O> = vec![];
+        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
 
-        // Now move all Done/Error nodes to the end, preserving the order of
-        // the Pending/Waiting nodes.
-        //
-        // LOOP INVARIANT:
-        //     self.nodes[0..index - dead_nodes] are the first remaining nodes
-        //     self.nodes[index - dead_nodes..index] are all dead
-        //     self.nodes[index..] are unchanged
-        for index in 0..orig_nodes_len {
+        for index in indexes {
             let node = &self.nodes[index];
+
             match node.state.get() {
-                NodeState::Pending | NodeState::Waiting => {
-                    if dead_nodes > 0 {
-                        self.nodes.swap(index, index - dead_nodes);
-                        node_rewrites[index] -= dead_nodes;
-                    }
-                }
+                NodeState::Pending | NodeState::Waiting => (),
                 NodeState::Done => {
                     // This lookup can fail because the contents of
                     // `self.active_cache` are not guaranteed to match those of
                     // `self.nodes`. See the comment in `process_obligation`
                     // for more details.
                     if let Some((predicate, _)) =
-                        self.active_cache.remove_entry(node.obligation.as_predicate())
-                    {
+                        self.active_cache.remove_entry(node.obligation.as_predicate()) {
                         self.done_cache.insert(predicate);
                     } else {
                         self.done_cache.insert(node.obligation.as_predicate().clone());
                     }
+
                     if do_completed == DoCompleted::Yes {
                         // Extract the success stories.
-                        removed_done_obligations.push(node.obligation.clone());
+                        done_obligations.push(node.obligation.clone());
                     }
-                    node_rewrites[index] = orig_nodes_len;
-                    dead_nodes += 1;
+
+                    self.nodes.remove(index);
                 }
                 NodeState::Error => {
                     // We *intentionally* remove the node from the cache at this point. Otherwise
@@ -646,76 +659,69 @@ impl<O: ForestObligation> ObligationForest<O> {
                     // check against.
                     self.active_cache.remove(node.obligation.as_predicate());
                     self.insert_into_error_cache(index);
-                    node_rewrites[index] = orig_nodes_len;
-                    dead_nodes += 1;
+
+                    self.nodes.remove(index);
                 }
                 NodeState::Success => unreachable!()
             }
         }
 
-        if dead_nodes > 0 {
-            // Remove the dead nodes and rewrite indices.
-            self.nodes.truncate(orig_nodes_len - dead_nodes);
-            self.apply_rewrites(&node_rewrites);
-        }
-
-        node_rewrites.truncate(0);
-        self.node_rewrites.replace(node_rewrites);
+        self.cleanup();
 
         if do_completed == DoCompleted::Yes {
-            Some(removed_done_obligations)
+            Some(done_obligations)
         } else {
             None
         }
     }
 
-    fn apply_rewrites(&mut self, node_rewrites: &[usize]) {
-        let orig_nodes_len = node_rewrites.len();
+    fn cleanup(&mut self) {
+        // WIP! we can avoid this one.
+        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
 
-        for node in &mut self.nodes {
+        for index in indexes.iter() {
             let mut i = 0;
-            while i < node.dependents.len() {
-                let new_index = node_rewrites[node.dependents[i]];
-                if new_index >= orig_nodes_len {
+            let mut first = true;
+            let mut len = self.nodes[*index].dependents.len();
+
+            while i < len {
+                let removed = !self.nodes.contains(self.nodes[*index].dependents[i]);
+
+                if removed {
+                    let node = &mut self.nodes[*index];
                     node.dependents.swap_remove(i);
-                    if i == 0 && node.has_parent {
+                    len -= 1;
+                    if first {
                         // We just removed the parent.
                         node.has_parent = false;
                     }
                 } else {
-                    node.dependents[i] = new_index;
                     i += 1;
                 }
+
+                first = false;
             }
         }
 
         // This updating of `self.active_cache` is necessary because the
         // removal of nodes within `compress` can fail. See above.
-        self.active_cache.retain(|_predicate, index| {
-            let new_index = node_rewrites[*index];
-            if new_index >= orig_nodes_len {
-                false
-            } else {
-                *index = new_index;
-                true
-            }
-        });
+        self.active_cache.retain(|_, index| indexes.contains(index));
     }
 }
 
 // I need a Clone closure.
 #[derive(Clone)]
-struct GetObligation<'a, O>(&'a [Node<O>]);
+struct GetObligation<'a, O>(&'a Arena<Node<O>>);
 
-impl<'a, 'b, O> FnOnce<(&'b usize,)> for GetObligation<'a, O> {
+impl<'a, 'b, O> FnOnce<(&'b ArenaIndex,)> for GetObligation<'a, O> {
     type Output = &'a O;
-    extern "rust-call" fn call_once(self, args: (&'b usize,)) -> &'a O {
+    extern "rust-call" fn call_once(self, args: (&'b ArenaIndex,)) -> &'a O {
         &self.0[*args.0].obligation
     }
 }
 
-impl<'a, 'b, O> FnMut<(&'b usize,)> for GetObligation<'a, O> {
-    extern "rust-call" fn call_mut(&mut self, args: (&'b usize,)) -> &'a O {
+impl<'a, 'b, O> FnMut<(&'b ArenaIndex,)> for GetObligation<'a, O> {
+    extern "rust-call" fn call_mut(&mut self, args: (&'b ArenaIndex,)) -> &'a O {
         &self.0[*args.0].obligation
     }
 }

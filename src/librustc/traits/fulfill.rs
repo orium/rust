@@ -204,7 +204,7 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentContext<'tcx> {
         self.select_where_possible(infcx)?;
 
         let errors: Vec<_> =
-            self.predicates.to_errors(CodeAmbiguity)
+            self.predicates.get_errors(CodeAmbiguity)
                            .into_iter()
                            .map(|e| to_fulfillment_error(e))
                            .collect();
