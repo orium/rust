@@ -1173,8 +1173,6 @@ dependencies = [
 [[package]]
 name = "generational-arena"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "921c3803adaeb9f9639de5149d9f0f9f4b79f00c423915b701db2e02ed80b9ce"
 dependencies = [
  "cfg-if",
 ]

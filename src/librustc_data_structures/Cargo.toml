@@ -25,7 +25,8 @@ rayon-core = { version = "0.3.0", package = "rustc-rayon-core" }
 rustc-hash = "1.0.1"
 smallvec = { version = "0.6.7", features = ["union", "may_dangle"] }
 rustc_index = { path = "../librustc_index", package = "rustc_index" }
-generational-arena = "0.2"
+generational-arena = { path = "../../../generational-arena" }
+# WIP! "0.2"
 
 [dependencies.parking_lot]
 version = "0.9"
