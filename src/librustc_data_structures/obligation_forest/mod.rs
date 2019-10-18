@@ -662,7 +662,9 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     fn cleanup(&mut self) {
-        for (index, node) in self.nodes.iter_mut() {
+        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
+
+        for index in indexes {
             let mut i = 0;
             let mut first = true;
             let mut len = self.nodes[index].dependents.len();
@@ -671,6 +673,7 @@ impl<O: ForestObligation> ObligationForest<O> {
                 let removed = !self.nodes.contains(self.nodes[index].dependents[i]);
 
                 if removed {
+                    let node = &mut self.nodes[index];
                     node.dependents.swap_remove(i);
                     len -= 1;
                     if first {
