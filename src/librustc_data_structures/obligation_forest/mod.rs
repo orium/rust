@@ -366,8 +366,14 @@ impl<O: ForestObligation> ObligationForest<O> {
             })
             .collect();
 
-        let successful_obligations = self.compress(DoCompleted::Yes);
-        assert!(successful_obligations.unwrap().is_empty());
+        let do_completed =
+            match cfg!(debug_assertions) {
+                true  => DoCompleted::Yes,
+                false => DoCompleted::No,
+            };
+
+        let successful_obligations = self.compress(do_completed);
+        debug_assert!(successful_obligations.unwrap().is_empty());
         errors
     }
 
@@ -612,7 +618,7 @@ impl<O: ForestObligation> ObligationForest<O> {
     /// on these nodes may be present. This is done by e.g., `process_cycles`.
     #[inline(never)]
     fn compress(&mut self, do_completed: DoCompleted) -> Option<Vec<O>> {
-        let mut done_obligations: Vec<O> = vec![]; // WIP! how about small vec?
+        let mut done_obligations: Vec<O> = vec![];
         let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect(); // WIP!
 
         for index in indexes {
@@ -662,9 +668,11 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     fn cleanup(&mut self) {
-        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
-
-        for index in indexes {
+        for slot in self.nodes.iter_slots() {
+            let index = match self.nodes.resolve_slot(slot) {
+                Some(i) => i,
+                None => continue,
+            };
             let mut i = 0;
             let mut first = true;
             let mut len = self.nodes[index].dependents.len();
@@ -712,3 +720,6 @@ impl<'a, 'b, O> FnMut<(&'b ArenaIndex,)> for GetObligation<'a, O> {
         &self.0[*args.0].obligation
     }
 }
+
+// WIP! Smallvecs everywhere?  Do this on a another PR.
+// WIP! Can we do these kind of optimizations on chalk?
