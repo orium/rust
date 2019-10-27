@@ -79,7 +79,7 @@ use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash;
 use std::marker::PhantomData;
-use generational_arena::{VecArena, Index as ArenaIndex};
+use generational_arena::{StableArena, Index as ArenaIndex};
 
 mod graphviz;
 
@@ -142,7 +142,7 @@ pub struct ObligationForest<O: ForestObligation> {
     /// `rustc_index::newtype_index!` indices, because this code is hot enough that the
     /// `u32`-to-`usize` conversions that would be required are significant,
     /// and space considerations are not important.
-    nodes: VecArena<Node<O>>,
+    nodes: StableArena<Node<O>>,
 
     /// A cache of predicates that have been successfully completed.
     done_cache: FxHashSet<O::Predicate>,
@@ -269,7 +269,7 @@ pub struct Error<O, E> {
 impl<O: ForestObligation> ObligationForest<O> {
     pub fn new() -> ObligationForest<O> {
         ObligationForest {
-            nodes: VecArena::new(),
+            nodes: StableArena::new(),
             done_cache: Default::default(),
             active_cache: Default::default(),
             obligation_tree_id_generator: (0..).map(ObligationTreeId),
@@ -408,9 +408,18 @@ impl<O: ForestObligation> ObligationForest<O> {
 
         let mut errors = vec![];
         let mut stalled = true;
-        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect();
+        let mut iter = self.nodes.iter_foo();
+        let mut remaining = self.nodes.len();
 
-        for index in indexes {
+        while let Some(index) = iter.next(&self.nodes) {
+            // Inside the loop we add new nodes to `self.nodes`.  Because of this we need to avoid
+            // iterating over the new elements.  Since `StableArena` preserves insertion order this
+            // is enough.
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+
             let node = &mut self.nodes[index];
 
             debug!("process_obligations: node {:?} == {:?}", index, node);
@@ -457,6 +466,8 @@ impl<O: ForestObligation> ObligationForest<O> {
                 }
             }
         }
+
+        // println!("GREPME nodes size: {}", self.nodes.len());
 
         if stalled {
             // There's no need to perform marking, cycle processing and compression when nothing
@@ -619,9 +630,9 @@ impl<O: ForestObligation> ObligationForest<O> {
     #[inline(never)]
     fn compress(&mut self, do_completed: DoCompleted) -> Option<Vec<O>> {
         let mut done_obligations: Vec<O> = vec![];
-        let indexes: Vec<ArenaIndex> = self.nodes.iter().map(|(index, _)| index).collect(); // WIP!
+        let mut iter = self.nodes.iter_foo();
 
-        for index in indexes {
+        while let Some(index) = iter.next(&self.nodes) {
             let node = &self.nodes[index];
 
             match node.state.get() {
@@ -668,11 +679,9 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     fn cleanup(&mut self) {
-        for slot in self.nodes.iter_slots() {
-            let index = match self.nodes.resolve_slot(slot) {
-                Some(i) => i,
-                None => continue,
-            };
+        let mut iter = self.nodes.iter_foo();
+
+        while let Some(index) = iter.next(&self.nodes) {
             let mut i = 0;
             let mut first = true;
             let mut len = self.nodes[index].dependents.len();
@@ -706,7 +715,7 @@ impl<O: ForestObligation> ObligationForest<O> {
 
 // I need a Clone closure.
 #[derive(Clone)]
-struct GetObligation<'a, O>(&'a VecArena<Node<O>>);
+struct GetObligation<'a, O>(&'a StableArena<Node<O>>);
 
 impl<'a, 'b, O> FnOnce<(&'b ArenaIndex,)> for GetObligation<'a, O> {
     type Output = &'a O;
